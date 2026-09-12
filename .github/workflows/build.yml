@@ -181,7 +181,13 @@ jobs:
           test -n "$apksigner"
           verification=$("$apksigner" verify --verbose --print-certs "${apks[0]}")
           printf '%s\n' "$verification"
-          actual_fingerprint=$(printf '%s\n' "$verification" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+          actual_fingerprint=$(printf '%s\n' "$verification" \
+            | sed -nE 's/^.* certificate SHA-256 digest: ([[:xdigit:]]{64})[[:space:]]*$/\1/p' \
+            | tr '[:upper:]' '[:lower:]' | sort -u)
+          if [[ ! "$actual_fingerprint" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not extract one unique APK signing certificate SHA-256 digest"
+            exit 1
+          fi
           if [[ "$actual_fingerprint" != "$EXPECTED_FINGERPRINT" ]]; then
             echo "::error::APK signing certificate does not match the release keystore"
             exit 1
