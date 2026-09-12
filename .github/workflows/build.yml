@@ -1,38 +1,93 @@
-name: Build
+name: Build Release
 
 on:
-  push:
-    paths-ignore:
-      - "**.md"
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "正式版本标签，例如 v1.1.0。"
+        required: true
+        default: "v1.1.0"
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 concurrency:
-  group: "${{ github.workflow }}-${{ github.ref }}"
-  cancel-in-progress: true
+  group: "${{ github.workflow }}-${{ inputs.tag }}"
+  cancel-in-progress: false
 
 env:
   ONDK_VERSION: "r30.1"
+  RELEASE_TAG: ${{ inputs.tag }}
 
 jobs:
   build-apk:
-    name: Build APK
+    name: Build and publish Release APK
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release tag
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Tag must be a release version such as v1.1.0"
+            exit 1
+          fi
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            tag_commit=$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")
+            if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
+              echo "::error::Release tag already points to another commit"
+              exit 1
+            fi
+          fi
 
       - name: Set up JDK
         uses: actions/setup-java@v6
         with:
           java-version: 21
           distribution: zulu
+
+      - name: 解码 PKCS#12 发布签名密钥
+        id: signing
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/release-signing.p12
+          SIGNING_KEY_BASE64: ${{ secrets.SIGNING_KEY_BASE64 }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in SIGNING_KEY_BASE64 KEY_ALIAS KEY_STORE_PASSWORD KEY_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing required secret: $name"
+              exit 1
+            fi
+          done
+          umask 077
+          printf '%s' "$SIGNING_KEY_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+          test -s "$KEYSTORE_PATH"
+          openssl pkcs12 -in "$KEYSTORE_PATH" -passin env:KEY_STORE_PASSWORD -noout
+          keytool -J-Duser.language=en -list \
+            -storetype PKCS12 -keystore "$KEYSTORE_PATH" \
+            -storepass:env KEY_STORE_PASSWORD -alias "$KEY_ALIAS" \
+            | grep -q PrivateKeyEntry
+          keytool -exportcert \
+            -storetype PKCS12 -keystore "$KEYSTORE_PATH" \
+            -storepass:env KEY_STORE_PASSWORD -alias "$KEY_ALIAS" \
+            -file "$RUNNER_TEMP/release-signing.der"
+          fingerprint=$(sha256sum "$RUNNER_TEMP/release-signing.der" | cut -d ' ' -f 1)
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
@@ -51,7 +106,7 @@ jobs:
 
       - name: Test extractor
         working-directory: tools/extract_rs
-        run: cargo test --release
+        run: cargo test --release --locked
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
@@ -74,47 +129,87 @@ jobs:
       - name: Link ONDK Rust toolchain
         run: rustup toolchain link ondk "${{ runner.temp }}/ondk/toolchains/rust"
 
-      - name: Decode Android signing key
-        if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
-        run: echo ${{ secrets.SIGNING_KEY }} | base64 -d > keystore.jks
-
-      - name: Build Release APK
+      - name: Android Lint (Release)
+        id: lint
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/release-signing.p12
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          export ONDK_HOME="${{ runner.temp }}/ondk"
+          set -euo pipefail
+          export ONDK_HOME="$RUNNER_TEMP/ondk"
           export ANDROID_NDK_HOME="$ONDK_HOME"
           export NDK_ROOT="$ONDK_HOME"
-          export KEYSTORE_PATH="../keystore.jks"
-          export KEYSTORE_PASS="${{ secrets.KEY_STORE_PASSWORD }}"
-          export KEY_ALIAS="${{ secrets.ALIAS }}"
-          export KEY_PASSWORD="${{ secrets.KEY_PASSWORD }}"
-          ./gradlew :app:assembleRelease --no-daemon
+          ./gradlew :app:lintRelease --no-daemon --no-configuration-cache
 
-      - name: Rename Release APK
-        run: mv app/build/outputs/apk/release/*.apk GhostLock-release.apk
+      - name: Upload Release Lint reports
+        if: ${{ always() && steps.lint.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: lint-release
+          path: |
+            app/build/reports/lint-results-release.html
+            app/build/reports/lint-results-release.xml
+          if-no-files-found: warn
+
+      - name: Build Release APK
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/release-signing.p12
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          export ONDK_HOME="$RUNNER_TEMP/ondk"
+          export ANDROID_NDK_HOME="$ONDK_HOME"
+          export NDK_ROOT="$ONDK_HOME"
+          ./gradlew :app:assembleRelease --no-daemon --no-configuration-cache
+
+      - name: Verify and prepare Release APK
+        env:
+          EXPECTED_FINGERPRINT: ${{ steps.signing.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/release/*.apk)
+          if [[ ${#apks[@]} -ne 1 ]]; then
+            echo "::error::Expected exactly one Release APK"
+            exit 1
+          fi
+          apksigner=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -n 1)
+          test -n "$apksigner"
+          verification=$("$apksigner" verify --verbose --print-certs "${apks[0]}")
+          printf '%s\n' "$verification"
+          actual_fingerprint=$(printf '%s\n' "$verification" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+          if [[ "$actual_fingerprint" != "$EXPECTED_FINGERPRINT" ]]; then
+            echo "::error::APK signing certificate does not match the release keystore"
+            exit 1
+          fi
+          mv "${apks[0]}" GhostLock-release.apk
+          sha256sum GhostLock-release.apk > GhostLock-release.apk.sha256
 
       - name: Upload Release APK
         uses: actions/upload-artifact@v7
         with:
           name: GhostLock-release
-          path: GhostLock-release.apk
-          archive: false
+          path: |
+            GhostLock-release.apk
+            GhostLock-release.apk.sha256
+          if-no-files-found: error
 
-  post_telegram:
-    needs: [build-apk]
-    runs-on: ubuntu-latest
-    if: ${{ success() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.ref_type != 'tag' }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - uses: actions/download-artifact@v8
-        with:
-          path: artifacts
-
-      - name: Post to Telegram
+      - name: Publish GitHub Release
         env:
-          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          BOT_API_LINK: ${{ secrets.BOT_API_LINK }}
-        run: bash .github/scripts/post_telegram.sh
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            GhostLock-release.apk GhostLock-release.apk.sha256 \
+            --target "$GITHUB_SHA" --title "GhostLock $RELEASE_TAG" \
+            --generate-notes --draft
+          gh release edit "$RELEASE_TAG" --draft=false --latest
+
+      - name: Remove signing files
+        if: ${{ always() }}
+        run: rm -f -- "$RUNNER_TEMP/release-signing.p12" "$RUNNER_TEMP/release-signing.der"

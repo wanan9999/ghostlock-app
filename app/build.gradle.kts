@@ -1,14 +1,30 @@
 @file:Suppress("UnstableApiUsage")
 
-import java.util.Properties
-
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
 val appName = "GhostLock"
-val appVersionName = "1.1"
+val appVersionName = providers.environmentVariable("RELEASE_TAG").orElse("1.1").get()
+
+val signingVariables = listOf("KEYSTORE_PATH", "KEY_STORE_PASSWORD", "KEY_ALIAS", "KEY_PASSWORD")
+    .associateWith { providers.environmentVariable(it).orNull }
+val missingSigningVariables = signingVariables.filterValues { it.isNullOrEmpty() }.keys.toList()
+val releaseKeystore = signingVariables["KEYSTORE_PATH"]?.takeIf { it.isNotBlank() }?.let(::file)
+
+tasks.matching { it.name == "preReleaseBuild" }.configureEach {
+    val missing = missingSigningVariables
+    val keystore = releaseKeystore
+    doFirst {
+        check(missing.isEmpty()) {
+            "Release signing requires environment variables: ${missing.joinToString()}"
+        }
+        check(keystore != null && keystore.isFile && keystore.length() > 0L) {
+            "KEYSTORE_PATH must point to a non-empty PKCS#12 keystore"
+        }
+    }
+}
 
 val gitVersionCode = runCatching {
     providers.exec {
@@ -101,23 +117,15 @@ android {
             kotlin.directories.add(supportedKernelsSrc.get().asFile.absolutePath)
         }
     }
-    val properties = Properties()
-    runCatching { properties.load(project.rootProject.file("local.properties").inputStream()) }
-    val keystorePath = (properties.getProperty("KEYSTORE_PATH") ?: System.getenv("KEYSTORE_PATH"))?.trim()?.takeIf { it.isNotEmpty() }
-    val keystorePwd = properties.getProperty("KEYSTORE_PASS") ?: System.getenv("KEYSTORE_PASS")
-    val alias = properties.getProperty("KEY_ALIAS") ?: System.getenv("KEY_ALIAS")
-    val pwd = properties.getProperty("KEY_PASSWORD") ?: System.getenv("KEY_PASSWORD")
-    val keystoreFile = keystorePath?.let(::file)?.takeIf { it.isFile && it.length() > 0L }
-    if (keystoreFile != null) {
-        signingConfigs {
-            create("release") {
-                storeFile = keystoreFile
-                storePassword = keystorePwd
-                keyAlias = alias
-                keyPassword = pwd
-                enableV2Signing = true
-                enableV3Signing = true
-            }
+    signingConfigs {
+        create("release") {
+            storeFile = releaseKeystore
+            storeType = "PKCS12"
+            storePassword = signingVariables["KEY_STORE_PASSWORD"]
+            keyAlias = signingVariables["KEY_ALIAS"]
+            keyPassword = signingVariables["KEY_PASSWORD"]
+            enableV2Signing = true
+            enableV3Signing = true
         }
     }
     buildTypes {
@@ -125,14 +133,14 @@ android {
             optimization.enable = true
             vcsInfo.include = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfig = signingConfigs.getByName(if (keystoreFile != null) "release" else "debug")
-        }
-        debug {
-            signingConfig = signingConfigs.getByName(if (keystoreFile != null) "release" else "debug")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
     buildFeatures {
         buildConfig = true
+    }
+    lint {
+        abortOnError = true
     }
     dependenciesInfo {
         includeInApk = false
@@ -162,7 +170,7 @@ androidComponents {
 }
 
 base {
-    archivesName.set("$appName-v$appVersionName($gitVersionCode)")
+    archivesName.set("$appName-v${appVersionName.removePrefix("v")}($gitVersionCode)")
 }
 
 kotlin {

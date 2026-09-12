@@ -291,21 +291,6 @@ private fun GhostlockAboutDialog(
                     },
                 )
             }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(text = stringResource(R.string.join_channel) + " ")
-                Text(
-                    text = AnnotatedString(
-                        text = "Telegram",
-                        spanStyle = SpanStyle(
-                            textDecoration = TextDecoration.Underline,
-                            color = MiuixTheme.colorScheme.primary,
-                        ),
-                    ),
-                    modifier = Modifier.clickable {
-                        uriHandler.openUri("https://t.me/YuKongA13579")
-                    },
-                )
-            }
             Text(
                 modifier = Modifier.padding(top = 10.dp),
                 text = stringResource(R.string.opensource_info),

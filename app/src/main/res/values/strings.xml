@@ -7,7 +7,6 @@
     <string name="advanced_settings">Parse</string>
     <string name="about">About</string>
     <string name="view_source">View Source:</string>
-    <string name="join_channel">Join Channel:</string>
     <string name="opensource_info">Copyright © 2026 YuKongA</string>
     <string name="action_import_offsets">Import offsets.json</string>
     <string name="action_export_offsets">Export offsets.json</string>

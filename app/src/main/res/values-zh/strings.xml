@@ -7,7 +7,6 @@
     <string name="advanced_settings">高级</string>
     <string name="about">关于</string>
     <string name="view_source">查看源码：</string>
-    <string name="join_channel">加入频道：</string>
     <string name="opensource_info">版权所有 © 2026 YuKongA</string>
     <string name="action_import_offsets">导入 offsets.json</string>
     <string name="action_export_offsets">导出 offsets.json</string>

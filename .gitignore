@@ -13,3 +13,5 @@ __pycache__
 target/
 *.jks
 *.keystore
+*.p12
+*.pfx
